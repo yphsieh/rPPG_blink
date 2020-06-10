@@ -4,6 +4,12 @@ import cv2
 import pylab
 import os
 import sys
+from scipy.spatial import distance as dist
+from imutils.video import FileVideoStream
+from imutils.video import VideoStream
+from imutils import face_utils
+import imutils
+import dlib
 
 
 def resource_path(relative_path):
@@ -19,8 +25,19 @@ def resource_path(relative_path):
 
 class findFaceGetPulse(object):
 
-    def __init__(self, bpm_limits=[], data_spike_limit=250,
+    def __init__(self, detector, predictor, bpm_limits=[], data_spike_limit=250,
                  face_detector_smoothness=10):
+
+        self.detector=detector
+        self.predictor=predictor
+        self.EYE_AR_THRESH = 0.27
+        self.EYE_AR_CONSEC_FRAMES = 2
+        (self.lStart, self.lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+        (self.rStart, self.rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+        self.TOTAL = 0
+        self.COUNTER = 0
+        self.ear = 0
+        self.ears = []
 
         self.frame_in = np.zeros((10, 10))
         self.frame_out = np.zeros((10, 10))
@@ -97,7 +114,7 @@ class findFaceGetPulse(object):
         np.savetxt("data.dat", data)
         np.savetxt("times.dat", self.times)
         freqs = 60. * self.freqs
-        idx = np.where((freqs > 50) & (freqs < 180))
+        idx = np.where((freqs > 50) & (freqs < 100))
         pylab.figure()
         n = data.shape[0]
         for k in xrange(n):
@@ -117,11 +134,60 @@ class findFaceGetPulse(object):
         pylab.savefig("data_fft.png")
         quit()
 
+    def eye_aspect_ratio(self, eye):
+        # compute the euclidean distances between the two sets of
+        # vertical eye landmarks (x, y)-coordinates
+        A = dist.euclidean(eye[1], eye[5])
+        B = dist.euclidean(eye[2], eye[4])
+
+        # compute the euclidean distance between the horizontal
+        # eye landmark (x, y)-coordinates
+        C = dist.euclidean(eye[0], eye[3])
+
+        # compute the eye aspect ratio
+        ear = (A + B) / (2.0 * C)
+
+        # return the eye aspect ratio
+        return ear
+
+    def blink(self, rects):
+        for rect in rects:
+            shape = self.predictor(self.gray, rect)
+            shape = face_utils.shape_to_np(shape)
+
+            leftEye = shape[self.lStart:self.lEnd]
+            rightEye = shape[self.rStart:self.rEnd]
+            leftEAR = self.eye_aspect_ratio(leftEye)
+            rightEAR = self.eye_aspect_ratio(rightEye)
+
+            self.ear = (leftEAR + rightEAR) / 2.0
+
+            leftEyeHull = cv2.convexHull(leftEye)
+            rightEyeHull = cv2.convexHull(rightEye)
+            cv2.drawContours(self.frame_out, [leftEyeHull], -1, (0, 255, 0), 1)
+            cv2.drawContours(self.frame_out, [rightEyeHull], -1, (0, 255, 0), 1)
+
+            if self.ear < self.EYE_AR_THRESH:
+                self.COUNTER += 1
+
+            else:
+                if self.COUNTER >= self.EYE_AR_CONSEC_FRAMES:
+                    self.TOTAL += 1
+
+                self.COUNTER = 0
+
+            if len(self.ears) < 10:
+                self.ears.append(self.ear)
+            else :
+                self.EYE_AR_THRESH = (np.average(self.ears)-0.01)
+                print('threshold:', self.EYE_AR_THRESH)
+
     def run(self, cam):
         self.times.append(time.time() - self.t0)
         self.frame_out = self.frame_in
-        self.gray = cv2.equalizeHist(cv2.cvtColor(self.frame_in,
-                                                  cv2.COLOR_BGR2GRAY))
+        self.gray = cv2.equalizeHist(cv2.cvtColor(self.frame_in, cv2.COLOR_BGR2GRAY))
+        rects = self.detector(self.gray, 0)
+
         col = (100, 255, 100)
         if self.find_faces:
             cv2.putText(
@@ -137,8 +203,7 @@ class findFaceGetPulse(object):
             detected = list(self.face_cascade.detectMultiScale(self.gray,
                                                                scaleFactor=1.3,
                                                                minNeighbors=4,
-                                                               minSize=(
-                                                                   50, 50),
+                                                               minSize=(50, 50),
                                                                flags=cv2.CASCADE_SCALE_IMAGE))
 
             if len(detected) > 0:
@@ -146,7 +211,7 @@ class findFaceGetPulse(object):
 
                 if self.shift(detected[-1]) > 10:
                     self.face_rect = detected[-1]
-            forehead1 = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+            forehead1 = self.get_subface_coord(0.5, 0.13, 0.25, 0.15)
             self.draw_rect(self.face_rect, col=(255, 0, 0))
             x, y, w, h = self.face_rect
             cv2.putText(self.frame_out, "Face",
@@ -170,18 +235,26 @@ class findFaceGetPulse(object):
         
         if self.start_record:
             cv2.putText(self.frame_out, "Press 'F' to save",
-                   (10, 125), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
+                   (10, 100), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
         else :
             cv2.putText(self.frame_out, "Press 'G' to start recording",
                    (10, 100), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
         
         cv2.putText(self.frame_out, "Press 'Esc' to quit",
-                   (10, 150), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
+                   (10, 125), cv2.FONT_HERSHEY_PLAIN, 1.5, col)
 
-        forehead1 = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+
+        cv2.putText(self.frame_out, "Blinks: {}".format(self.TOTAL),
+                    (800, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(self.frame_out, "EAR: {:.2f}".format(self.ear),
+                    (1000, 30),cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        forehead1 = self.get_subface_coord(0.5, 0.13, 0.25, 0.15)
         self.draw_rect(forehead1)
 
         vals = self.get_subface_means(forehead1)
+
+        self.blink(rects)
 
         self.data_buffer.append(vals)
         L = len(self.data_buffer)
@@ -206,7 +279,7 @@ class findFaceGetPulse(object):
             self.freqs = float(self.fps) / L * np.arange(L / 2 + 1)
 
             freqs = 60. * self.freqs
-            idx = np.where((freqs > 50) & (freqs < 180))
+            idx = np.where((freqs > 50) & (freqs < 100))
 
             pruned = self.fft[idx]
             phase = phase[idx]
@@ -224,7 +297,7 @@ class findFaceGetPulse(object):
             self.bpm = self.freqs[idx2]
             self.idx += 1
 
-            x, y, w, h = self.get_subface_coord(0.5, 0.18, 0.25, 0.15)
+            x, y, w, h = self.get_subface_coord(0.5, 0.13, 0.25, 0.15)
             r = alpha * self.frame_in[y:y + h, x:x + w, 0]
             g = alpha * \
                 self.frame_in[y:y + h, x:x + w, 1] + \
